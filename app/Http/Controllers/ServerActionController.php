@@ -81,9 +81,36 @@ class ServerActionController extends Controller
     }
 
     /**
-     * Internal callback endpoint called by `scripts/server-runner.ps1` with X-Internal-Token.
+     * Return the oldest pending queued action for `scripts/lodis-worker.ps1` (protected by X-Internal-Token).
      */
-    public function callback(Request $request, SslCheckerService $sslChecker): JsonResponse
+    public function pending(): JsonResponse
+    {
+        $pendingLog = ServerActionLog::query()
+            ->where('status', 'queued')
+            ->oldest('id')
+            ->first();
+
+        if (! $pendingLog) {
+            return response()->json([
+                'has_pending' => false,
+                'item' => null,
+            ]);
+        }
+
+        return response()->json([
+            'has_pending' => true,
+            'item' => [
+                'log_id' => $pendingLog->id,
+                'action' => $pendingLog->action_type,
+                'status' => $pendingLog->status,
+            ],
+        ]);
+    }
+
+    /**
+     * Internal callback endpoint called by `scripts/lodis-worker.ps1` with X-Internal-Token.
+     */
+    public function callback(Request $request, SslCheckerService $sslChecker, ServerActionService $actionService): JsonResponse
     {
         $validated = $request->validate([
             'log_id' => ['required', 'integer', 'exists:server_action_logs,id'],
@@ -101,6 +128,7 @@ class ServerActionController extends Controller
 
         if (in_array($validated['status'], ['success', 'failed'], true)) {
             $updateData['finished_at'] = now();
+            $actionService->removeFromQueueTriggerFile((int) $log->id);
         }
 
         $log->update($updateData);

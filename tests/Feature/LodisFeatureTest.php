@@ -4,7 +4,9 @@ use App\Mail\SslExpiringMail;
 use App\Models\AppSetting;
 use App\Models\MonitoredDomain;
 use App\Models\ServerActionLog;
+use App\Models\TelegramSession;
 use App\Models\User;
+use App\Services\ServerActionService;
 use App\Services\SslCheckerService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
@@ -37,16 +39,24 @@ test('ip whitelist middleware allows access when empty and blocks non-whiteliste
         ->assertOk();
 });
 
-test('strict command whitelisting accepts reload_webserver and renew_ssl with 202 accepted and rejects arbitrary commands', function () {
+test('strict command whitelisting accepts reload_webserver and renew_ssl with 202 accepted, writes queue file without cmd.exe, and rejects arbitrary commands', function () {
     $user = User::factory()->create();
 
-    $this->actingAs($user)
+    $response = $this->actingAs($user)
         ->postJson(route('server-actions.trigger'), [
             'action' => 'reload_webserver',
         ])
         ->assertStatus(202)
         ->assertJsonPath('action', 'reload_webserver')
         ->assertJsonPath('status', 'queued');
+
+    $logId = (int) $response->json('log_id');
+    $queueFilePath = app(ServerActionService::class)->getQueueFilePath();
+    expect(is_file($queueFilePath))->toBeTrue();
+
+    $queueContents = json_decode((string) file_get_contents($queueFilePath), true);
+    expect($queueContents)->toBeArray()
+        ->and(collect($queueContents)->contains(fn ($item) => (int) ($item['log_id'] ?? 0) === $logId && ($item['action'] ?? '') === 'reload_webserver'))->toBeTrue();
 
     $this->actingAs($user)
         ->postJson(route('server-actions.trigger'), [
@@ -63,7 +73,7 @@ test('strict command whitelisting accepts reload_webserver and renew_ssl with 20
         ->assertJsonValidationErrors(['action']);
 });
 
-test('internal action callback requires valid X-Internal-Token and updates server action log', function () {
+test('internal pending-actions and action-callback endpoints work with X-Internal-Token and clean up queue trigger file', function () {
     config(['lodis.internal_api_token' => 'secret-callback-token']);
 
     $log = ServerActionLog::factory()->create([
@@ -71,11 +81,20 @@ test('internal action callback requires valid X-Internal-Token and updates serve
         'status' => 'queued',
     ]);
 
-    $this->postJson('/api/internal/action-callback', [
-        'log_id' => $log->id,
-        'status' => 'success',
-        'output' => 'Reloaded Apache2.4 cleanly',
-    ])->assertStatus(401);
+    app(ServerActionService::class)->writeQueueTriggerFile($log);
+
+    $this->withHeader('X-Internal-Token', 'secret-callback-token')
+        ->getJson('/api/internal/pending-actions')
+        ->assertOk()
+        ->assertJsonPath('has_pending', true)
+        ->assertJsonPath('item.log_id', $log->id);
+
+    $this->withoutHeader('X-Internal-Token')
+        ->postJson('/api/internal/action-callback', [
+            'log_id' => $log->id,
+            'status' => 'success',
+            'output' => 'Reloaded Apache2.4 cleanly',
+        ])->assertStatus(401);
 
     $this->withHeader('X-Internal-Token', 'secret-callback-token')
         ->postJson('/api/internal/action-callback', [
@@ -90,6 +109,9 @@ test('internal action callback requires valid X-Internal-Token and updates serve
     expect($log->status)->toBe('success')
         ->and($log->output)->toContain('Reloaded Apache2.4 cleanly')
         ->and($log->finished_at)->not->toBeNull();
+
+    $queueContents = json_decode((string) file_get_contents(app(ServerActionService::class)->getQueueFilePath()), true);
+    expect(collect($queueContents)->contains(fn ($item) => (int) ($item['log_id'] ?? 0) === $log->id))->toBeFalse();
 });
 
 test('ssl checker service parses certificate timestamps and assigns valid, warning, and critical badges', function () {
@@ -182,4 +204,109 @@ test('ssl:check-reminder command sends notifications for expiring domains and en
         ->assertExitCode(0);
 
     Mail::assertSent(SslExpiringMail::class, 1);
+});
+
+test('interactive telegram webhook authenticates admin, deletes password message, handles inline keyboard callbacks, and locks after 5 failed attempts', function () {
+    Http::fake([
+        'https://api.telegram.org/*' => Http::response(['ok' => true, 'description' => 'Webhook was set'], 200),
+    ]);
+
+    config(['services.telegram.webhook_secret' => 'test-webhook-secret']);
+    AppSetting::setValue('telegram_bot_token', '123456:TEST_BOT_TOKEN');
+
+    $admin = User::factory()->create([
+        'name' => 'Admin Telegram',
+        'email' => 'admin@lodis.local',
+        'password' => bcrypt('SecretPass123!'),
+    ]);
+
+    // 1. Reject webhook call with missing/invalid secret token
+    $this->postJson('/api/telegram/webhook', [
+        'message' => ['chat' => ['id' => 998877], 'text' => '/start'],
+    ])->assertStatus(401);
+
+    // 2. /start command transitions session to awaiting_email
+    $this->withHeader('X-Telegram-Bot-Api-Secret-Token', 'test-webhook-secret')
+        ->postJson('/api/telegram/webhook', [
+            'message' => ['message_id' => 10, 'chat' => ['id' => 998877], 'text' => '/start'],
+        ])
+        ->assertOk();
+
+    $session = TelegramSession::query()->where('chat_id', '998877')->first();
+    expect($session)->not->toBeNull()
+        ->and($session->state)->toBe(TelegramSession::STATE_AWAITING_EMAIL);
+
+    // 3. Submit email -> transitions to awaiting_password
+    $this->withHeader('X-Telegram-Bot-Api-Secret-Token', 'test-webhook-secret')
+        ->postJson('/api/telegram/webhook', [
+            'message' => ['message_id' => 11, 'chat' => ['id' => 998877], 'text' => 'admin@lodis.local'],
+        ])
+        ->assertOk();
+
+    expect($session->refresh()->state)->toBe(TelegramSession::STATE_AWAITING_PASSWORD)
+        ->and($session->temp_email)->toBe('admin@lodis.local');
+
+    // 4. Submit password -> immediately calls deleteMessage and authenticates for 24 hours
+    $this->withHeader('X-Telegram-Bot-Api-Secret-Token', 'test-webhook-secret')
+        ->postJson('/api/telegram/webhook', [
+            'message' => ['message_id' => 12, 'chat' => ['id' => 998877], 'text' => 'SecretPass123!'],
+        ])
+        ->assertOk();
+
+    expect($session->refresh()->state)->toBe(TelegramSession::STATE_AUTHENTICATED)
+        ->and($session->user_id)->toBe($admin->id)
+        ->and($session->isAuthenticated())->toBeTrue();
+
+    Http::assertSent(fn ($request) => str_contains($request->url(), '/deleteMessage')
+        && (int) $request['message_id'] === 12);
+
+    // 5. Trigger Refresh Web Server via inline keyboard callback -> writes to lodis-queue.json without cmd.exe
+    $this->withHeader('X-Telegram-Bot-Api-Secret-Token', 'test-webhook-secret')
+        ->postJson('/api/telegram/webhook', [
+            'callback_query' => [
+                'id' => 'cb-1',
+                'data' => 'action_refresh_yes',
+                'message' => ['chat' => ['id' => 998877]],
+            ],
+        ])
+        ->assertOk();
+
+    expect(ServerActionLog::query()->where('user_id', $admin->id)->where('action_type', 'reload_webserver')->exists())->toBeTrue();
+
+    // 6. Logout via /logout command
+    $this->withHeader('X-Telegram-Bot-Api-Secret-Token', 'test-webhook-secret')
+        ->postJson('/api/telegram/webhook', [
+            'message' => ['message_id' => 15, 'chat' => ['id' => 998877], 'text' => '/logout'],
+        ])
+        ->assertOk();
+
+    expect($session->refresh()->state)->toBe(TelegramSession::STATE_IDLE)
+        ->and($session->user_id)->toBeNull();
+
+    // 7. Test 5 failed password attempts lock the session for 15 minutes
+    for ($i = 1; $i <= 5; $i++) {
+        $this->withHeader('X-Telegram-Bot-Api-Secret-Token', 'test-webhook-secret')
+            ->postJson('/api/telegram/webhook', [
+                'message' => ['message_id' => 20 + $i, 'chat' => ['id' => 998877], 'text' => '/login'],
+            ]);
+        $this->withHeader('X-Telegram-Bot-Api-Secret-Token', 'test-webhook-secret')
+            ->postJson('/api/telegram/webhook', [
+                'message' => ['message_id' => 30 + $i, 'chat' => ['id' => 998877], 'text' => 'admin@lodis.local'],
+            ]);
+        $this->withHeader('X-Telegram-Bot-Api-Secret-Token', 'test-webhook-secret')
+            ->postJson('/api/telegram/webhook', [
+                'message' => ['message_id' => 40 + $i, 'chat' => ['id' => 998877], 'text' => 'WrongPassword!'],
+            ]);
+    }
+
+    expect($session->refresh()->isLocked())->toBeTrue()
+        ->and($session->failed_attempts)->toBe(5);
+
+    // 8. Test telegram:set-webhook command
+    $this->artisan('telegram:set-webhook --url=https://lodis.instansi.go.id')
+        ->assertExitCode(0);
+
+    Http::assertSent(fn ($request) => str_contains($request->url(), '/setWebhook')
+        && $request['url'] === 'https://lodis.instansi.go.id/api/telegram/webhook'
+        && $request['secret_token'] === 'test-webhook-secret');
 });

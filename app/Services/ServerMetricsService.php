@@ -10,6 +10,11 @@ class ServerMetricsService
     /**
      * Retrieve Windows server CPU, RAM, Disk, and Web Server status with a 30-second cache.
      *
+     * Avast Behavior Shield Safe Mode:
+     * Never spawns `powershell.exe` or `cmd.exe` via `shell_exec` from PHP.
+     * Instead, reads metrics pushed by the background worker (`storage/app/lodis-metrics.json`)
+     * combined with native PHP disk and socket checks.
+     *
      * @return array{
      *     cpu_percent: float,
      *     ram_percent: float,
@@ -69,7 +74,7 @@ class ServerMetricsService
     }
 
     /**
-     * Collect CPU, RAM, Disk, and Web Server service/process state on Windows (with PHP fallback).
+     * Collect CPU, RAM, Disk, and Web Server state using worker snapshot file + native PHP functions (zero shell_exec).
      *
      * @return array{
      *     cpu_percent: float,
@@ -109,26 +114,13 @@ class ServerMetricsService
         $osName = PHP_OS_FAMILY === 'Windows' ? 'Windows Server / Laragon' : php_uname('s');
         $uptimeHours = 24.5;
 
-        if (PHP_OS_FAMILY === 'Windows' && ! app()->runningUnitTests()) {
-            $psCommand = 'powershell -NoProfile -NonInteractive -Command "'
-                .'$cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average; '
-                .'$os = Get-CimInstance Win32_OperatingSystem; '
-                .'$totalRam = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2); '
-                .'$freeRam = [math]::Round($os.FreePhysicalMemory / 1MB, 2); '
-                .'$usedRam = [math]::Round($totalRam - $freeRam, 2); '
-                .'$ramPct = if ($totalRam -gt 0) { [math]::Round(($usedRam / $totalRam) * 100, 1) } else { 0 }; '
-                .'$uptime = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalHours, 1); '
-                .'$proc = Get-Process -Name httpd,nginx,laragon,php,php-cgi -ErrorAction SilentlyContinue; '
-                .'$svc = Get-Service -Name Apache*,nginx*,W3SVC -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq \'Running\' }; '
-                .'$online = ($null -ne $proc -or $null -ne $svc); '
-                .'[PSCustomObject]@{cpu=[double]$cpu;ram_total=$totalRam;ram_used=$usedRam;ram_pct=$ramPct;online=[bool]$online;os=$os.Caption;uptime=$uptime} | ConvertTo-Json -Compress'
-                .'"';
+        $metricsFile = storage_path('app/lodis-metrics.json');
 
-            $rawOutput = @shell_exec($psCommand);
-
-            if (is_string($rawOutput) && trim($rawOutput) !== '') {
+        if (is_file($metricsFile)) {
+            $raw = @file_get_contents($metricsFile);
+            if (is_string($raw) && trim($raw) !== '') {
                 /** @var array<string, mixed>|null $decoded */
-                $decoded = json_decode(trim($rawOutput), true);
+                $decoded = json_decode(trim($raw), true);
 
                 if (is_array($decoded)) {
                     $cpuPercent = round((float) ($decoded['cpu'] ?? $cpuPercent), 1);
