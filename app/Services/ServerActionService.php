@@ -65,7 +65,7 @@ class ServerActionService
 
         if (PHP_OS_FAMILY === 'Windows') {
             $command = sprintf(
-                'start /B powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File %s -Action %s -LogId %d > NUL 2>&1',
+                'cmd /c start "" /B powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File %s -Action %s -LogId %d > NUL 2>&1',
                 $escapedScript,
                 $escapedAction,
                 $logId,

@@ -4,6 +4,7 @@
 .DESCRIPTION
     Executes strictly whitelisted server operations (reload_webserver or renew_ssl)
     after a 3-second grace delay so the HTTP 202 response cleanly reaches the client browser.
+    Supports both Windows Service mode and Laragon standalone Apache (httpd.exe) / Nginx processes.
     Reports stdout, stderr, and status back to POST /api/internal/action-callback.
 #>
 
@@ -83,15 +84,20 @@ function Send-ActionCallback {
         "Content-Type"     = "application/json"
     }
 
-    try {
-        Invoke-RestMethod -Uri $CallbackUrl -Method Post -Headers $headers -Body $payload -TimeoutSec 15 | Out-Null
-    } catch {
-        # Fallback if APP_URL uses a hostname not bound locally
+    $urlsToTry = @(
+        $CallbackUrl,
+        "http://127.0.0.1:8000/api/internal/action-callback",
+        "http://localhost:8000/api/internal/action-callback",
+        "http://127.0.0.1/lodis/public/api/internal/action-callback",
+        "http://lodis.test/api/internal/action-callback"
+    ) | Select-Object -Unique
+
+    foreach ($url in $urlsToTry) {
         try {
-            $fallbackUrl = "http://127.0.0.1:8000/api/internal/action-callback"
-            Invoke-RestMethod -Uri $fallbackUrl -Method Post -Headers $headers -Body $payload -TimeoutSec 10 | Out-Null
+            Invoke-RestMethod -Uri $url -Method Post -Headers $headers -Body $payload -TimeoutSec 10 | Out-Null
+            return
         } catch {
-            # Ignore secondary callback network failure
+            # Try next local callback URL
         }
     }
 }
@@ -111,50 +117,88 @@ try {
     if ($Action -eq "reload_webserver") {
         Write-LogLine "Executing reload_webserver for Laragon / Windows Web Server..."
 
-        # 1. Check if configured service exists as a Windows Service (e.g., Apache2.4, W3SVC, nginx)
+        # 1. Check if configured service exists as an installed Windows Service (e.g., Apache2.4, W3SVC, nginx)
         $serviceObj = Get-Service -Name $WebServerService -ErrorAction SilentlyContinue
 
         if ($null -ne $serviceObj) {
-            Write-LogLine "Found Windows Service '$WebServerService' (Current Status: $($serviceObj.Status)). Restarting service..."
+            Write-LogLine "Found installed Windows Service '$WebServerService' (Current Status: $($serviceObj.Status)). Restarting service..."
             $restartOut = Restart-Service -Name $WebServerService -Force -PassThru -ErrorAction Stop 2>&1 | Out-String
             if ($restartOut.Trim() -ne "") {
                 Write-LogLine $restartOut.Trim()
             }
             Write-LogLine "Windows Service '$WebServerService' restarted successfully."
-        } else {
-            Write-LogLine "Windows Service '$WebServerService' not registered as a service. Checking Laragon Apache / Nginx processes..."
+        }
+        else {
+            Write-LogLine "Windows Service '$WebServerService' is not registered as a service. Detecting Laragon standalone processes..."
 
-            # Check for Laragon Apache httpd.exe graceful restart or process reload
-            $apacheProc = Get-Process -Name "httpd" -ErrorAction SilentlyContinue | Select-Object -First 1
-            $nginxProc = Get-Process -Name "nginx" -ErrorAction SilentlyContinue | Select-Object -First 1
+            # Detect running Apache httpd.exe process via WMI/CIM (captures ExecutablePath even for standalone processes)
+            $apacheCim = Get-CimInstance Win32_Process -Filter "Name = 'httpd.exe'" -ErrorAction SilentlyContinue | Select-Object -First 1
+            $nginxCim = Get-CimInstance Win32_Process -Filter "Name = 'nginx.exe'" -ErrorAction SilentlyContinue | Select-Object -First 1
 
-            if ($null -ne $apacheProc) {
-                $httpdPath = $apacheProc.Path
-                Write-LogLine "Detected running Laragon Apache process: $httpdPath (PID: $($apacheProc.Id))"
-
-                if ($null -ne $httpdPath -and (Test-Path $httpdPath)) {
-                    $apacheOut = & $httpdPath -k restart 2>&1 | Out-String
-                    Write-LogLine "Executed '$httpdPath -k restart': $($apacheOut.Trim())"
-                } else {
-                    Write-LogLine "Apache httpd is active and healthy (PID: $($apacheProc.Id)). Graceful signal completed."
-                }
-            } elseif ($null -ne $nginxProc) {
-                $nginxPath = $nginxProc.Path
-                $nginxDir = Split-Path -Parent $nginxPath
-                Write-LogLine "Detected running Laragon Nginx process: $nginxPath (PID: $($nginxProc.Id))"
-                Push-Location $nginxDir
-                $nginxOut = & $nginxPath -s reload 2>&1 | Out-String
-                Pop-Location
-                Write-LogLine "Executed 'nginx -s reload': $($nginxOut.Trim())"
+            # Fallback binary search in C:\laragon\bin\apache if Apache is currently stopped
+            $httpdPath = if ($null -ne $apacheCim -and $apacheCim.ExecutablePath) {
+                $apacheCim.ExecutablePath
             } else {
-                # Check common Laragon installation paths
-                $laragonApache = Get-ChildItem -Path "C:\laragon\bin\apache\apache*\bin\httpd.exe" -ErrorAction SilentlyContinue | Select-Object -Last 1
-                if ($null -ne $laragonApache) {
-                    Write-LogLine "Found Laragon Apache binary at $($laragonApache.FullName). Testing syntax (httpd -t)..."
-                    $syntaxOut = & $laragonApache.FullName -t 2>&1 | Out-String
-                    Write-LogLine $syntaxOut.Trim()
+                $foundBinary = Get-ChildItem -Path "C:\laragon\bin\apache\*\bin\httpd.exe" -ErrorAction SilentlyContinue | Select-Object -Last 1
+                if ($null -ne $foundBinary) { $foundBinary.FullName } else { $null }
+            }
+
+            if ($null -ne $httpdPath -and (Test-Path $httpdPath)) {
+                $apacheBinDir = Split-Path -Parent $httpdPath
+                $apacheRootDir = Split-Path -Parent $apacheBinDir
+
+                Write-LogLine "Target Laragon Apache binary: $httpdPath"
+                Write-LogLine "Step 1/3: Validating Apache configuration syntax (httpd.exe -t)..."
+
+                $syntaxLines = & cmd.exe /c "`"$httpdPath`" -d `"$apacheRootDir`" -t 2>&1"
+                $syntaxText = ($syntaxLines | Out-String).Trim()
+                if ($syntaxText -ne "") {
+                    Write-LogLine "Syntax Check Output: $syntaxText"
                 }
-                Write-LogLine "Web server reload sequence completed cleanly."
+
+                if ($LASTEXITCODE -ne 0 -and $syntaxText -notmatch "Syntax OK") {
+                    throw "Apache configuration syntax check (httpd -t) failed! Aborting restart to prevent server downtime."
+                }
+
+                $oldPids = (Get-Process -Name "httpd" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id) -join ", "
+                if ($oldPids -ne "") {
+                    Write-LogLine "Step 2/3: Stopping running standalone Apache httpd.exe processes (PIDs: $oldPids)..."
+                    Stop-Process -Name "httpd" -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Milliseconds 900
+                } else {
+                    Write-LogLine "Step 2/3: No running httpd.exe processes found. Preparing fresh start..."
+                }
+
+                Write-LogLine "Step 3/3: Starting Laragon Apache standalone daemon in background..."
+                Start-Process -FilePath $httpdPath -WorkingDirectory $apacheRootDir -WindowStyle Hidden
+                Start-Sleep -Seconds 1
+
+                $newProcs = Get-Process -Name "httpd" -ErrorAction SilentlyContinue
+                if ($null -ne $newProcs) {
+                    $newPids = ($newProcs | Select-Object -ExpandProperty Id) -join ", "
+                    Write-LogLine "[SUCCESS] Laragon Apache (httpd.exe) restarted and running cleanly (New PIDs: $newPids)."
+                } else {
+                    throw "Apache httpd.exe process did not stay running after start."
+                }
+            }
+            elseif ($null -ne $nginxCim -and $nginxCim.ExecutablePath -and (Test-Path $nginxCim.ExecutablePath)) {
+                $nginxPath = $nginxCim.ExecutablePath
+                $nginxDir = Split-Path -Parent $nginxPath
+                Write-LogLine "Detected running Laragon Nginx process: $nginxPath (PID: $($nginxCim.ProcessId))"
+
+                Push-Location $nginxDir
+                $testOut = & $nginxPath -t 2>&1 | Out-String
+                Write-LogLine "Nginx Syntax Check: $($testOut.Trim())"
+                $reloadOut = & $nginxPath -s reload 2>&1 | Out-String
+                Pop-Location
+
+                if ($reloadOut.Trim() -ne "") {
+                    Write-LogLine $reloadOut.Trim()
+                }
+                Write-LogLine "[SUCCESS] Laragon Nginx reloaded cleanly."
+            }
+            else {
+                throw "Tidak ditemukan layanan '$WebServerService' maupun binary Apache/Nginx Laragon di C:\laragon\bin."
             }
         }
     }
@@ -183,8 +227,7 @@ try {
         }
         else {
             Write-LogLine "[WARNING] win-acme executable not found at '$WinAcmePath' and WIN_ACME_TASK_NAME is empty."
-            Write-LogLine "[INFO] Simulating win-acme check & triggering internal SSL certificate re-scan..."
-            Write-LogLine "win-acme 2.2.x (Laragon Windows Server) - All active certificates verified."
+            Write-LogLine "[INFO] Triggering internal SSL certificate re-scan for all active monitored domains..."
         }
     }
 }
@@ -195,7 +238,6 @@ catch {
 
 Write-LogLine "Action '$Action' finished with status: $($FinalStatus.ToUpper())"
 
-# Wait 1 second before callback if web server just reloaded
 if ($Action -eq "reload_webserver") {
     Start-Sleep -Seconds 1
 }

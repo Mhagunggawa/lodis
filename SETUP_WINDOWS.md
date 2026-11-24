@@ -146,7 +146,9 @@ Setelah task `win-acme-renew` terdaftar:
 1. Isi `WIN_ACME_TASK_NAME=win-acme-renew` pada file `.env` (atau melalui menu **Pengaturan & Reminder** di dashboard Lodis).
 2. Saat tombol **Renew SSL (win-acme)** diklik di dashboard, skrip `scripts/server-runner.ps1` akan memicu `schtasks.exe /Run /TN "win-acme-renew"`, atau jika `WIN_ACME_TASK_NAME` dikosongkan, langsung mengeksekusi `C:\win-acme\wacs.exe --renew`.
 
-### 5.2 Izin Reload Web Server Laragon (`scripts/server-runner.ps1`)
+### 5.2 Izin Reload Web Server Laragon (`scripts/server-runne
+
+r.ps1`)
 
 Skrip `scripts/server-runner.ps1` dirancang khusus untuk arsitektur **Single-Server Laragon**:
 1. **Jeda Asinkron 3 Detik (`Start-Sleep -Seconds 3`):** Saat admin menekan tombol **Refresh Web Server**, Laravel mengembalikan HTTP `202 Accepted` seketika, sementara proses PowerShell menunggu 3 detik sebelum me-reload Apache/Nginx.
